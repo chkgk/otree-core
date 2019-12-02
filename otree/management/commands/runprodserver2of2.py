@@ -34,4 +34,13 @@ class Command(BaseCommand):
             'timeoutworkeronly', 'otree timeoutworkeronly', quiet=False, env=env_copy
         )
 
+        # add one worker for each task
+        from otree.extensions import get_extensions_modules
+        channel_name_routes = []
+        for extensions_module in get_extensions_modules('routing'):
+            channel_name_routes += getattr(extensions_module, "channel_name_routes", {}).keys()
+
+        for route in channel_name_routes:
+            manager.add_process('backgroundworker', 'otree runworker %s' % route, quiet=False, env=env_copy)
+
         return manager

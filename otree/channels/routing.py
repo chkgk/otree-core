@@ -30,12 +30,19 @@ websocket_routes = [
     url(r'^no_op/$', consumers.NoOp),
 ]
 
+# for channels background tasks
+channel_routes = {}
 
 extensions_modules = get_extensions_modules('routing')
 for extensions_module in extensions_modules:
     websocket_routes += getattr(extensions_module, 'websocket_routes', [])
+    # combine routes into one dict. It's a little dangerous, because it updates / merges the dictionaries.
+    channel_routes.update(getattr(extensions_module, "channel_name_routes", {}))
 
 
 application = ProtocolTypeRouter(
-    {"websocket": AuthMiddlewareStack(URLRouter(websocket_routes))}
+    {
+        "websocket": AuthMiddlewareStack(URLRouter(websocket_routes)),
+        "channel": ChannelNameRouter(channel_routes)
+     }
 )
