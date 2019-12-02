@@ -1,16 +1,17 @@
 import logging
-import subprocess
+import os
 import sys
 import time
-import os
-import requests
+from enum import Enum
+from subprocess import check_output, Popen
+from urllib.parse import urljoin
+
 from django.conf import settings
 from django.urls import reverse
-from urllib.parse import urljoin
-import otree.channels.utils as channel_utils
-
-from otree.session import SESSION_CONFIGS_DICT
 from ws4py.client.threadedclient import WebSocketClient
+
+import otree.channels.utils as channel_utils
+from otree.session import SESSION_CONFIGS_DICT
 
 AUTH_FAILURE_MESSAGE = """
 Could not login to the server using your ADMIN_USERNAME
@@ -20,72 +21,124 @@ and password on your local oTree installation match that
 on the server.
 """
 
+logger = logging.getLogger(__name__)
+
+try:
+    from requests import session as requests_session
+except ModuleNotFoundError:
+    sys.exit(
+        'To use command-line browser bots, you need to install the "requests" library locally. '
+        'Do: "pip3 install requests"'
+    )
+
+
+class OSEnum(Enum):
+    windows = 'windows'
+    mac = 'mac'
+    linux = 'linux'
+
 
 BROWSER_CMDS = {
-    'windows': {
+    OSEnum.windows: {
         'chrome': [
             'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
             'C:/Program Files/Google/Chrome/Application/chrome.exe',
-            os.getenv('LOCALAPPDATA', '') + r"\Google\Chrome\Application\chrome.exe",
-            ],
+            os.getenv('LOCALAPPDATA', '') + r"/Google/Chrome/Application/chrome.exe",
+        ]
     },
-    'mac': {
-        'chrome': ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'],
+    OSEnum.mac: {
+        'chrome': ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
     },
-    'linux': {
-        'chrome': ['google-chrome'],
-    }
+    OSEnum.linux: {'chrome': ['google-chrome']},
 }
 
-def windows_mac_or_linux():
+
+def windows_mac_or_linux() -> OSEnum:
     if sys.platform.startswith("win"):
-        platform = 'windows'
+        return OSEnum.windows
     elif sys.platform.startswith("darwin"):
-        platform = 'mac'
+        return OSEnum.mac
     else:
-        platform = 'linux'
-    return platform
+        return OSEnum.linux
+
+
+class URLs:
+    login = '/accounts/login/'
+    create_browser_bots = reverse('CreateBrowserBotsSession')
+    close_browser_bots = reverse('CloseBrowserBotsSession')
+    browser_bots_start = reverse('BrowserBotStartLink')
+
+
+WEBSOCKET_COMPLETED_MESSAGE = b'closed_by_browser_launcher'
+WEBSOCKET_1000 = 1000
 
 
 class OtreeWebSocketClient(WebSocketClient):
-
-    def __init__(self, *args, **kwargs):
-        self.session_size = kwargs.pop('session_size')
+    def __init__(self, *args, session_size, **kwargs):
+        self.session_size = session_size
         self.seen_participant_codes = set()
         self.participants_finished = 0
-        super(OtreeWebSocketClient, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def received_message(self, message):
+        '''
+        This is called automatically when the client receives a message
+        '''
         code = message
         if code not in self.seen_participant_codes:
             self.seen_participant_codes.add(code)
             self.participants_finished += 1
             if self.participants_finished == self.session_size:
-                self.close(reason='success')
+                self.close(reason=WEBSOCKET_COMPLETED_MESSAGE, code=WEBSOCKET_1000)
+
+    def closed(self, code, reason=None):
+        '''
+        make sure the websocket closed properly,
+        not because of server-side exception etc.
+        '''
+        # i used to check "reason", but for some reason it's always an empty string.
+        if code != WEBSOCKET_1000:
+            logger.error(
+                f'Lost connection with server. '
+                f'code: {code}, reason: "{reason}".'
+                'Check the oTree server logs for errors.'
+            )
+            # don't know why, but this is not actually exiting,
+            # even though it's in the same process.
+            # even putting a breakpoint here just gets skipped past.
+            sys.exit(-1)
+
+
+def run_websocket_client_until_finished(*, websocket_url, session_size) -> float:
+    '''for easy patching'''
+    bot_start_time = time.time()
+    ws_client = OtreeWebSocketClient(websocket_url, session_size=session_size)
+    ws_client.connect()
+    ws_client.run_forever()
+    return round(time.time() - bot_start_time, 1)
 
 
 class Launcher:
-
-    def __init__(self, options):
-        self.options = options
+    def __init__(self, *, session_config_name, server_url, num_participants):
+        self.session_config_name = session_config_name
+        self.server_url = server_url
+        self.num_participants = num_participants
 
     def run(self):
-        options = self.options
 
         self.check_browser()
         self.set_urls()
-        self.client = requests.session()
+        self.client = requests_session()
         self.ping_server()
         self.server_configuration_check()
 
         sessions_to_create = []
 
-        if options["session_config_name"]:
-            session_config_name = options["session_config_name"]
+        session_config_name = self.session_config_name
+        if session_config_name:
             if session_config_name not in SESSION_CONFIGS_DICT:
                 raise ValueError(
-                    'No session config named "{}"'.format(
-                        session_config_name)
+                    'No session config named "{}"'.format(session_config_name)
                 )
             session_config_names = [session_config_name]
 
@@ -101,13 +154,16 @@ class Launcher:
             session_config = SESSION_CONFIGS_DICT[session_config_name]
             num_bot_cases = session_config.get_num_bot_cases()
             for case_number in range(num_bot_cases):
-                num_participants = (options.get('num_participants') or
-                                    session_config['num_demo_participants'])
-                sessions_to_create.append({
-                    'session_config_name': session_config_name,
-                    'num_participants': num_participants,
-                    'case_number': case_number,
-                })
+                num_participants = (
+                    self.num_participants or session_config['num_demo_participants']
+                )
+                sessions_to_create.append(
+                    {
+                        'session_config_name': session_config_name,
+                        'num_participants': num_participants,
+                        'case_number': case_number,
+                    }
+                )
 
         total_time_spent = 0
         # run in a separate loop, because we want to validate upfront
@@ -116,9 +172,7 @@ class Launcher:
         for session_to_create in sessions_to_create:
             total_time_spent += self.run_session(**session_to_create)
 
-        print('Total: {} seconds'.format(
-            round(total_time_spent, 1)
-        ))
+        print('Total: {} seconds'.format(round(total_time_spent, 1)))
 
         # don't delete sessions -- it's too susceptible to race conditions
         # between sending the completion message and loading the last page
@@ -126,8 +180,7 @@ class Launcher:
         # just label these sessions clearly in the admin UI
         # and make it easy to delete manually
 
-    def run_session(
-            self, session_config_name, num_participants, case_number):
+    def run_session(self, session_config_name, num_participants, case_number):
         self.close_existing_session()
 
         browser_process = self.launch_browser(num_participants)
@@ -136,13 +189,10 @@ class Launcher:
         print(row_fmt.format(session_config_name, num_participants), end='')
 
         session_code = self.create_session(
-            session_config_name, num_participants, case_number)
+            session_config_name, num_participants, case_number
+        )
 
-        bot_start_time = time.time()
-
-        self.websocket_listen(session_code, num_participants)
-
-        time_spent = round(time.time() - bot_start_time, 1)
+        time_spent = self.websocket_listen(session_code, num_participants)
         print('...finished in {} seconds'.format(time_spent))
 
         # TODO:
@@ -153,26 +203,23 @@ class Launcher:
         browser_process.terminate()
         return time_spent
 
-    def websocket_listen(self, session_code, num_participants):
+    def websocket_listen(self, session_code, num_participants) -> float:
         # seems that urljoin doesn't work with ws:// urls
         # so do the ws replace after URLjoin
         websocket_url = urljoin(
-            self.server_url,
-            channel_utils.browser_bots_launcher_path(session_code)
+            self.server_url, channel_utils.browser_bots_launcher_path(session_code)
         )
-        websocket_url = websocket_url.replace(
-            'http://', 'ws://').replace('https://', 'wss://')
+        websocket_url = websocket_url.replace('http://', 'ws://').replace(
+            'https://', 'wss://'
+        )
 
-        ws_client = OtreeWebSocketClient(
-            websocket_url,
-            session_size=num_participants,
+        return run_websocket_client_until_finished(
+            websocket_url=websocket_url, session_size=num_participants
         )
-        ws_client.connect()
-        ws_client.run_forever()
 
     def set_urls(self):
         # SERVER URL
-        server_url = self.options['server_url']
+        server_url = self.server_url
         # if it doesn't start with http:// or https://,
         # assume http://
         if not server_url.startswith('http'):
@@ -180,18 +227,15 @@ class Launcher:
         self.server_url = server_url
 
         # CREATE_SESSION URL
-        self.create_session_url = urljoin(
-            server_url,
-            reverse('CreateBrowserBotsSession')
-        )
+        self.create_session_url = urljoin(server_url, URLs.create_browser_bots)
 
         # LOGIN URL
         # TODO: use reverse? reverse('django.contrib.auth.views.login')
-        self.login_url = urljoin(server_url, '/accounts/login/')
+        self.login_url = urljoin(server_url, URLs.login)
 
     def post(self, url, data=None):
         data = data or {}
-        data.update({'csrfmiddlewaretoken': self.client.cookies['csrftoken']})
+        data.update(csrfmiddlewaretoken=self.client.cookies['csrftoken'])
         # need to set the referer for CSRF protection to work when using HTTPS
         return self.client.post(url, data, headers={'referer': url})
 
@@ -221,13 +265,7 @@ class Launcher:
 
             # get it again, we are logged in now
             resp = self.client.get(self.create_session_url)
-        server_check = resp.json()  # noqa
-
-        # no need to warn about these for now
-        # if server_check['runserver']:
-        #     print(RUNSERVER_WARNING)
-        # if server_check['sqlite']:
-        #     print(SQLITE_WARNING)
+        assert resp.ok
 
     def ping_server(self):
 
@@ -240,35 +278,27 @@ class Launcher:
 
         except:
             raise Exception(
-                'Could not connect to server at {}.'
+                f'Could not connect to server at {self.server_url}.'
                 'Before running this command, '
-                'you need to run the server (see --server-url flag).'.format(
-                    self.server_url,
-                )
+                'you need to run the server (see --server-url flag).'
             )
         if not resp.ok:
             raise Exception(
-                'Could not open page at {}.'
-                '(HTTP status code: {})'.format(
-                    self.login_url,
-                    resp.status_code,
-                )
+                f'Could not open page at {self.login_url}.'
+                f'(HTTP status code: {resp.status_code})'
             )
 
-    def create_session(
-            self, session_config_name, num_participants, case_number
-            ):
-
+    def create_session(self, session_config_name, num_participants, case_number):
         resp = self.post(
             self.create_session_url,
-            data={
-                'session_config_name': session_config_name,
-                'num_participants': num_participants,
-                'case_number': case_number,
-            }
+            data=dict(
+                session_config_name=session_config_name,
+                num_participants=num_participants,
+                case_number=case_number,
+            ),
         )
         assert resp.ok, 'Failed to create session. Check the server logs.'
-        session_code = resp.content.decode('utf-8')
+        session_code = resp.text
         return session_code
 
     def check_browser(self):
@@ -290,11 +320,13 @@ class Launcher:
         else:
             return
 
-        if windows_mac_or_linux() == 'windows':
+        if platform == OSEnum.windows:
             process_list_args = ['tasklist']
         else:
             process_list_args = ['ps', 'axw']
-        ps_output = subprocess.check_output(process_list_args).decode('utf-8')
+        ps_output = check_output(process_list_args).decode(
+            sys.stdout.encoding, 'ignore'
+        )
         is_running = browser_type.lower() in ps_output.lower()
 
         if is_running:
@@ -306,8 +338,7 @@ class Launcher:
 
     def close_existing_session(self):
         # make sure room is closed
-        resp = self.post(
-            urljoin(self.server_url, reverse('CloseBrowserBotsSession')))
+        resp = self.post(urljoin(self.server_url, URLs.close_browser_bots))
         if not resp.ok:
             raise AssertionError(
                 'Request to close existing browser bots session failed. '
@@ -315,17 +346,25 @@ class Launcher:
             )
 
     def launch_browser(self, num_participants):
-        wait_room_url = urljoin(
-            self.server_url,
-            reverse('BrowserBotStartLink')
-        )
+        wait_room_url = urljoin(self.server_url, URLs.browser_bots_start)
 
         for browser_cmd in self.browser_cmds:
             args = [browser_cmd]
+            if os.environ.get('BROWSER_BOTS_USE_HEADLESS'):
+                args.append('--headless')
+                # needed in windows
+                args.append('--disable-gpu')
+
+                # for some reason --screenshot OR --remote-debugging-port is necessary to get my JS to execute?!?
+                # NO idea why. --remote-debugging-port gets me further than --screenshot, which gets stuck
+                # on skip_lookahead
+                # --remote-debugging-port=9222 works also
+                args.append('--remote-debugging-port=9222')
+
             for i in range(num_participants):
                 args.append(wait_room_url)
             try:
-                return subprocess.Popen(args)
+                return Popen(args)
             except FileNotFoundError:
                 pass
         msg = (

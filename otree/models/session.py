@@ -1,24 +1,21 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import logging
-import channels
-import json
-from django.urls import reverse
+import time
 
-from otree import constants_internal
-import otree.common_internal
-from otree.common_internal import (
-    random_chars_8, random_chars_10, get_admin_secret_code,
-    get_app_label_from_name
-)
-
-
-from otree.db import models
-from otree.models_concrete import ParticipantToPlayerLookup, RoomToSession
-from django.template.loader import get_template
 from django.template import TemplateDoesNotExist
-from .varsmixin import ModelWithVars
+from django.template.loader import select_template
+
+import otree.common
+import otree.constants
+from otree.channels.utils import auto_advance_group
+from otree.common import (
+    random_chars_8,
+    random_chars_10,
+    get_admin_secret_code,
+    get_app_label_from_name,
+    FieldTrackerWithVarsSupport,
+)
+from otree.db import models
+from otree.models_concrete import RoomToSession
 
 
 logger = logging.getLogger('otree')
@@ -26,26 +23,25 @@ logger = logging.getLogger('otree')
 
 ADMIN_SECRET_CODE = get_admin_secret_code()
 
-class Session(ModelWithVars):
 
+class Session(models.Model):
     class Meta:
         app_label = "otree"
         # if i don't set this, it could be in an unpredictable order
         ordering = ['pk']
 
-    _pickle_fields = ['vars', 'config']
-    config = models._PickleField(default=dict, null=True)  # type: dict
+    _ft = FieldTrackerWithVarsSupport()
+    vars: dict = models._PickleField(default=dict)
+    config: dict = models._PickleField(default=dict, null=True)
 
     # label of this session instance
     label = models.CharField(
-        max_length=300, null=True, blank=True,
-        help_text='For internal record-keeping')
+        max_length=300, null=True, blank=True, help_text='For internal record-keeping'
+    )
 
     experimenter_name = models.CharField(
-        max_length=300, null=True, blank=True,
-        help_text='For internal record-keeping')
-
-    ready_for_browser = models.BooleanField(default=False)
+        max_length=300, null=True, blank=True, help_text='For internal record-keeping'
+    )
 
     code = models.CharField(
         default=random_chars_8,
@@ -53,41 +49,52 @@ class Session(ModelWithVars):
         # set non-nullable, until we make our CharField non-nullable
         null=False,
         unique=True,
-        doc="Randomly generated unique identifier for the session.")
+        doc="Randomly generated unique identifier for the session.",
+    )
 
     mturk_HITId = models.CharField(
-        max_length=300, null=True, blank=True,
-        help_text='Hit id for this session on MTurk')
+        max_length=300,
+        null=True,
+        blank=True,
+        help_text='Hit id for this session on MTurk',
+    )
     mturk_HITGroupId = models.CharField(
-        max_length=300, null=True, blank=True,
-        help_text='Hit id for this session on MTurk')
+        max_length=300,
+        null=True,
+        blank=True,
+        help_text='Hit id for this session on MTurk',
+    )
 
     # since workers can drop out number of participants on server should be
     # greater than number of participants on mturk
     # value -1 indicates that this session it not intended to run on mturk
     mturk_num_participants = models.IntegerField(
-        default=-1,
-        help_text="Number of participants on MTurk")
+        default=-1, help_text="Number of participants on MTurk"
+    )
 
     mturk_use_sandbox = models.BooleanField(
-        default=True,
-        help_text="Should this session be created in mturk sandbox?")
+        default=True, help_text="Should this session be created in mturk sandbox?"
+    )
+
+    # use Float instead of DateTime because DateTime
+    # is a pain to work with (e.g. naive vs aware datetime objects)
+    # and there is no need here for DateTime
+    mturk_expiration = models.FloatField(null=True)
 
     archived = models.BooleanField(
         default=False,
         db_index=True,
-        doc=("If set to True the session won't be visible on the "
-             "main ViewList for sessions"))
+        doc=(
+            "If set to True the session won't be visible on the "
+            "main ViewList for sessions"
+        ),
+    )
 
     comment = models.TextField(blank=True)
 
     _anonymous_code = models.CharField(
-        default=random_chars_10, max_length=10, null=False, db_index=True)
-
-    _pre_create_id = models.CharField(max_length=255, db_index=True, null=True)
-
-    def use_browser_bots(self):
-        return self.participant_set.filter(is_browser_bot=True).exists()
+        default=random_chars_10, max_length=10, null=False, db_index=True
+    )
 
     is_demo = models.BooleanField(default=False)
 
@@ -111,14 +118,18 @@ class Session(ModelWithVars):
         but still useful internally (like data export)'''
         return self.config['real_world_currency_per_point']
 
-    def is_for_mturk(self):
+    @property
+    def use_browser_bots(self):
+        return self.config.get('use_browser_bots', False)
+
+    def is_mturk(self):
         return (not self.is_demo) and (self.mturk_num_participants > 0)
 
     def get_subsessions(self):
         lst = []
         app_sequence = self.config['app_sequence']
         for app in app_sequence:
-            models_module = otree.common_internal.get_models_module(app)
+            models_module = otree.common.get_models_module(app)
             subsessions = models_module.Subsession.objects.filter(
                 session=self
             ).order_by('round_number')
@@ -127,10 +138,6 @@ class Session(ModelWithVars):
 
     def get_participants(self):
         return list(self.participant_set.order_by('id_in_session'))
-
-    def mturk_requester_url(self):
-        subdomain = 'requestersandbox' if self.mturk_use_sandbox else 'requester'
-        return "https://{}.mturk.com/mturk/manageHITs".format(subdomain)
 
     def mturk_worker_url(self):
         # different HITs
@@ -142,7 +149,6 @@ class Session(ModelWithVars):
         # not work is if the HIT was deleted from the server, but in that case,
         # the HIT itself should be canceled.
 
-
         # 2018-06-04:
         # the format seems to have changed to this:
         # https://worker.mturk.com/projects/{group_id}/tasks?ref=w_pl_prvw
@@ -151,9 +157,16 @@ class Session(ModelWithVars):
         # because it's more precise.
         subdomain = "workersandbox" if self.mturk_use_sandbox else 'www'
         return "https://{}.mturk.com/mturk/preview?groupId={}".format(
-            subdomain,
-            self.mturk_HITGroupId
+            subdomain, self.mturk_HITGroupId
         )
+
+    def mturk_is_expired(self):
+        # self.mturk_expiration is offset-aware, so therefore we must compare
+        # it against an offset-aware value.
+        return self.mturk_expiration and self.mturk_expiration < time.time()
+
+    def mturk_is_active(self):
+        return self.mturk_HITId and not self.mturk_is_expired()
 
     def advance_last_place_participants(self):
         # django.test takes 0.5 sec to import,
@@ -162,6 +175,7 @@ class Session(ModelWithVars):
         # so best to do it only here
         # it gets cached
         import django.test
+
         client = django.test.Client()
 
         participants = self.get_participants()
@@ -179,8 +193,7 @@ class Session(ModelWithVars):
 
         last_place_page_index = min([p._index_in_pages for p in participants])
         last_place_participants = [
-            p for p in participants
-            if p._index_in_pages == last_place_page_index
+            p for p in participants if p._index_in_pages == last_place_page_index
         ]
 
         for p in last_place_participants:
@@ -190,17 +203,19 @@ class Session(ModelWithVars):
                     resp = client.post(
                         current_form_page_url,
                         data={
-                            constants_internal.timeout_happened: True,
-                            constants_internal.admin_secret_code: ADMIN_SECRET_CODE
+                            otree.constants.timeout_happened: True,
+                            otree.constants.admin_secret_code: ADMIN_SECRET_CODE,
                         },
-                        follow=True
+                        follow=True,
                     )
                     # not sure why, but many users are getting HttpResponseNotFound
                     if resp.status_code >= 400:
-                        msg = ('Submitting page {} failed, '
+                        msg = (
+                            'Submitting page {} failed, '
                             'returned HTTP status code {}.'.format(
                                 current_form_page_url, resp.status_code
-                            ))
+                            )
+                        )
                         content = resp.content
                         if len(content) < 600:
                             msg += ' response content: {}'.format(content)
@@ -218,19 +233,16 @@ class Session(ModelWithVars):
                 logging.exception("Failed to advance participants.")
                 raise
 
-
             # do the auto-advancing here,
             # rather than in increment_index_in_pages,
             # because it's only needed here.
-            channels.Group(
-                'auto-advance-{}'.format(p.code)
-            ).send(
-                {'text': json.dumps(
-                    {'auto_advanced': True})}
+            otree.channels.utils.sync_group_send_wrapper(
+                type='auto_advanced', group=auto_advance_group(p.code), event={}
             )
 
     def get_room(self):
         from otree.room import ROOM_DICT
+
         try:
             room_name = RoomToSession.objects.get(session=self).room_name
             return ROOM_DICT[room_name]
@@ -243,24 +255,25 @@ class Session(ModelWithVars):
         Useful to define it here, for data export
         '''
 
-        return (
-            self.config['participation_fee'] +
-            payoff.to_real_world_currency(self)
-        )
+        return self.config['participation_fee'] + payoff.to_real_world_currency(self)
 
     def _set_admin_report_app_names(self):
 
         admin_report_app_names = []
         num_rounds_list = []
         for app_name in self.config['app_sequence']:
-            models_module = otree.common_internal.get_models_module(app_name)
+            models_module = otree.common.get_models_module(app_name)
             app_label = get_app_label_from_name(app_name)
             try:
-                get_template('{}/AdminReport.html'.format(app_label))
-                admin_report_app_names.append(app_name)
-                num_rounds_list.append(models_module.Constants.num_rounds)
+                select_template(
+                    [f'{app_label}/admin_report.html', f'{app_label}/AdminReport.html']
+                )
             except TemplateDoesNotExist:
                 pass
+            else:
+                admin_report_app_names.append(app_name)
+                num_rounds_list.append(models_module.Constants.num_rounds)
+
         self._admin_report_app_names = ';'.join(admin_report_app_names)
         self._admin_report_num_rounds = ';'.join(str(n) for n in num_rounds_list)
 

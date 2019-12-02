@@ -1,59 +1,109 @@
-from django.core import signals
-from django.core.exceptions import (
-    PermissionDenied, SuspiciousOperation,
-)
-from django.http.multipartparser import MultiPartParserError
-from django.urls import get_resolver, get_urlconf
-
 import contextlib
 import importlib
-import json
 import logging
 import time
+from typing import Optional
 
-import channels
-import otree.channels.utils as channel_utils
+import idmap
 import redis_lock
 import vanilla
 from django.conf import settings
-from django.core.urlresolvers import resolve
-from django.db.models import Max
+from django.core import signals
+from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.core.handlers.exception import handle_uncaught_exception
+from django.db.models import Max, Min
 from django.http import HttpResponseRedirect, Http404, HttpResponse
+from django.http.multipartparser import MultiPartParserError
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
+from django.urls import get_resolver, get_urlconf
+from django.urls import resolve
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext as _, ugettext_lazy
 from django.views.decorators.cache import never_cache, cache_control
-import idmap
-import otree.common_internal
-import otree.constants_internal as constants
+import django.forms.models
+from django.views.decorators.csrf import csrf_exempt
+
+import otree.bots.browser as browser_bots
+import otree.channels.utils as channel_utils
+import otree.common
+import otree.constants
 import otree.db.idmap
 import otree.forms
 import otree.models
 import otree.timeout.tasks
-from otree.bots.bot import bot_prettify_post_data
-import otree.bots.browser as browser_bots
-from otree.common_internal import (
-    get_app_label_from_import_path, get_dotted_name, get_admin_secret_code,
-    DebugTable, BotError, wait_page_thread_lock, ResponseForException
+from otree.bots.bot import bot_prettify_post_data, ExpectError
+from otree.common import (
+    get_app_label_from_import_path,
+    get_dotted_name,
+    get_admin_secret_code,
+    DebugTable,
+    BotError,
+    wait_page_thread_lock,
+    ResponseForException,
 )
-from otree.models import (
-    Participant, Session, BasePlayer, BaseGroup, BaseSubsession)
+from otree.models import Participant, Session, BasePlayer, BaseGroup, BaseSubsession
 from otree.models_concrete import (
-    PageCompletion, CompletedSubsessionWaitPage,
-    CompletedGroupWaitPage, PageTimeout, UndefinedFormModel,
+    PageCompletion,
+    CompletedSubsessionWaitPage,
+    CompletedGroupWaitPage,
+    PageTimeout,
+    UndefinedFormModel,
     ParticipantLockModel,
+    ParticipantToPlayerLookup,
 )
-from django.core.handlers.exception import handle_uncaught_exception
-
 
 logger = logging.getLogger(__name__)
 
 
 UNHANDLED_EXCEPTIONS = (
-    Http404, PermissionDenied, MultiPartParserError,
-    SuspiciousOperation, SystemExit
+    Http404,
+    PermissionDenied,
+    MultiPartParserError,
+    SuspiciousOperation,
+    SystemExit,
 )
+
+
+# make the technical 500 page auto-reload when the server restarts
+# when the websocket reconnects, that means the server must have restarted.
+# hardcode path to reconnecting-websocket because
+# can't use Django template tags because template is already rendered
+TECHNICAL_500_AUTORELOAD_JS = b'''
+<style>
+    #disconnected-alert {
+        position: fixed;
+        top: 0;
+        left: 0;
+        background-color: lightgray;
+        font-style: italic;
+        visibility: hidden;
+    }
+</style>
+<div id='disconnected-alert' class="top-left-fixed-alert" style="visibility: hidden">Lost server connection...</div>
+<script src="/static/otree/js/reconnecting-websocket-iife.min.js" type="text/javascript"></script>
+<script src="/static/otree/js/jquery-3.2.1.min.js"></script>
+<script src="/static/otree/js/common.js" type="text/javascript"></script>
+<script>
+    var disconnectionSocket;
+    
+    function setupDisconnectedAlert() {
+        disconnectionSocket = makeReconnectingWebSocket('/no_op/');
+        var socket = disconnectionSocket;
+
+        var alertStyle = document.querySelector('#disconnected-alert').style;
+        socket.onopen = function (e) {
+            alertStyle.visibility = 'hidden';
+        };
+
+        socket.onclose = function (e) {
+            alertStyle.visibility = 'visible';
+        };
+    }
+    setupDisconnectedAlert();
+</script>
+'''
+
 
 def response_for_exception(request, exc):
     '''simplified from Django 1.11 source.
@@ -62,22 +112,29 @@ def response_for_exception(request, exc):
     the original exception was wrapped in, which we don't want to show to users.
         '''
     if isinstance(exc, UNHANDLED_EXCEPTIONS):
-        '''copied from Django 1.11 source, but i don't think these
+        '''copied from Django source, but i don't think these
         exceptions will actually occur.'''
         raise exc
     signals.got_request_exception.send(sender=None, request=request)
     exc_info = (type(exc), exc, exc.__traceback__)
-    response = handle_uncaught_exception(
-        request, get_resolver(get_urlconf()), exc_info)
+    response = handle_uncaught_exception(request, get_resolver(get_urlconf()), exc_info)
+    if settings.DEBUG:
+        response_content = response.content.split(b'<div id="requestinfo">')[0]
+        response_content += TECHNICAL_500_AUTORELOAD_JS
+        response.content = response_content
 
     # Force a TemplateResponse to be rendered.
-    if not getattr(response, 'is_rendered', True) and callable(getattr(response, 'render', None)):
+    if not getattr(response, 'is_rendered', True) and callable(
+        getattr(response, 'render', None)
+    ):
         response = response.render()
 
     return response
 
+
 NO_PARTICIPANTS_LEFT_MSG = (
-    "The maximum number of participants for this session has been exceeded.")
+    "The maximum number of participants for this session has been exceeded."
+)
 
 ADMIN_SECRET_CODE = get_admin_secret_code()
 
@@ -100,8 +157,7 @@ def participant_scoped_db_lock(participant_code):
     start_time = time.time()
     while time.time() - start_time < TIMEOUT:
         updated_locks = ParticipantLockModel.objects.filter(
-            participant_code=participant_code,
-            locked=False
+            participant_code=participant_code, locked=False
         ).update(locked=True)
         if not updated_locks:
             time.sleep(0.2)
@@ -110,32 +166,34 @@ def participant_scoped_db_lock(participant_code):
                 yield
             finally:
                 ParticipantLockModel.objects.filter(
-                    participant_code=participant_code,
+                    participant_code=participant_code
                 ).update(locked=False)
             return
     exists = ParticipantLockModel.objects.filter(
         participant_code=participant_code
     ).exists()
     if not exists:
-        raise Http404((
-            "This user ({}) does not exist in the database. "
-            "Maybe the database was recreated."
-        ).format(participant_code))
+        raise Http404(
+            (
+                "This user ({}) does not exist in the database. "
+                "Maybe the database was reset."
+            ).format(participant_code)
+        )
 
     # could happen if the request that has the lock is paused somehow,
     # e.g. in a debugger
     raise Exception(
-        'Another HTTP request has the lock for participant {}.'.format(
-            participant_code))
+        'Another HTTP request has the lock for participant {}.'.format(participant_code)
+    )
 
 
 def get_redis_lock(*, name='global'):
-    if otree.common_internal.USE_REDIS:
+    if otree.common.USE_REDIS:
         return redis_lock.Lock(
-            redis_client=otree.common_internal.get_redis_conn(),
+            redis_client=otree.common.get_redis_conn(),
             name='OTREE_LOCK_{}'.format(name),
             expire=10,
-            auto_renewal=True
+            auto_renewal=True,
         )
 
 
@@ -169,8 +227,7 @@ class FormPageOrInGameWaitPage(vanilla.View):
     @classmethod
     def url_pattern(cls, name_in_url):
         p = r'^p/(?P<participant_code>\w+)/{}/{}/(?P<page_index>\d+)/$'.format(
-            name_in_url,
-            cls.__name__,
+            name_in_url, cls.__name__
         )
         return p
 
@@ -178,8 +235,10 @@ class FormPageOrInGameWaitPage(vanilla.View):
     def get_url(cls, participant_code, name_in_url, page_index):
         '''need this because reverse() is too slow in create_session'''
         return r'/p/{pcode}/{name_in_url}/{ClassName}/{page_index}/'.format(
-            pcode=participant_code, name_in_url=name_in_url,
-            ClassName=cls.__name__, page_index=page_index
+            pcode=participant_code,
+            name_in_url=name_in_url,
+            ClassName=cls.__name__,
+            page_index=page_index,
         )
 
     @classmethod
@@ -190,30 +249,30 @@ class FormPageOrInGameWaitPage(vanilla.View):
     def _redirect_to_page_the_user_should_be_on(self):
         return HttpResponseRedirect(self.participant._url_i_should_be_on())
 
+    @method_decorator(csrf_exempt)
     @method_decorator(never_cache)
-    @method_decorator(cache_control(must_revalidate=True, max_age=0,
-                                    no_cache=True, no_store=True))
-    def dispatch(self, *args, **kwargs):
-        participant_code = kwargs.pop(constants.participant_code)
+    @method_decorator(
+        cache_control(must_revalidate=True, max_age=0, no_cache=True, no_store=True)
+    )
+    def dispatch(self, request, participant_code, **kwargs):
 
-        if otree.common_internal.USE_REDIS:
+        if otree.common.USE_REDIS:
             lock = redis_lock.Lock(
-                otree.common_internal.get_redis_conn(),
+                otree.common.get_redis_conn(),
                 participant_code,
                 expire=60,
-                auto_renewal=True
+                auto_renewal=True,
             )
         else:
             lock = participant_scoped_db_lock(participant_code)
 
         with lock, otree.db.idmap.use_cache():
             try:
-                participant = Participant.objects.get(
-                    code=participant_code)
+                participant = Participant.objects.get(code=participant_code)
             except Participant.DoesNotExist:
                 msg = (
                     "This user ({}) does not exist in the database. "
-                    "Maybe the database was recreated."
+                    "Maybe the database was reset."
                 ).format(participant_code)
                 raise Http404(msg)
 
@@ -234,7 +293,7 @@ class FormPageOrInGameWaitPage(vanilla.View):
                 # player/group/etc.
                 if hasattr(response, 'render'):
                     response.render()
-            except ResponseForException as exc:
+            except (ResponseForException, ExpectError) as exc:
                 response = response_for_exception(
                     self.request, exc.__cause__ or exc.__context__
                 )
@@ -266,29 +325,29 @@ class FormPageOrInGameWaitPage(vanilla.View):
 
     def get_context_data(self, **context):
 
-        context.update({
-            'view': self,
-            # 2017-08-22: why do we need this?
-            'object': getattr(self, 'object', None),
-            'player': self.player,
-            'group': self.group,
-            'subsession': self.subsession,
-            'session': self.session,
-            'participant': self.participant,
-            'Constants': self._Constants,
+        context.update(
+            view=self,
+            object=getattr(self, 'object', None),
+            player=self.player,
+            group=self.group,
+            subsession=self.subsession,
+            session=self.session,
+            participant=self.participant,
+            Constants=self._Constants,
+            timer_text=getattr(self, 'timer_text', None),
+        )
 
-            # doesn't exist on wait pages, so need getattr
-            'timer_text': getattr(self, 'timer_text', None)
-        })
-
-        vars_for_template = {}
-        views_module = otree.common_internal.get_pages_module(
-            self.subsession._meta.app_config.name)
+        views_module = otree.common.get_pages_module(
+            self.subsession._meta.app_config.name
+        )
         if hasattr(views_module, 'vars_for_all_templates'):
-            vars_for_template.update(views_module.vars_for_all_templates(self) or {})
+            vars_for_template = views_module.vars_for_all_templates(self)
+        else:
+            vars_for_template = {}
 
         try:
             user_vars = self.vars_for_template()
+            context['js_vars'] = self.js_vars()
         except:
             raise ResponseForException
 
@@ -305,12 +364,13 @@ class FormPageOrInGameWaitPage(vanilla.View):
         Given a context dictionary, returns an HTTP response.
         """
         return TemplateResponse(
-            request=self.request,
-            template=self.get_template_names(),
-            context=context
+            request=self.request, template=self.get_template_names(), context=context
         )
 
     def vars_for_template(self):
+        return {}
+
+    def js_vars(self):
         return {}
 
     def _get_debug_tables(self, vars_for_template):
@@ -335,8 +395,8 @@ class FormPageOrInGameWaitPage(vanilla.View):
                 ('Round number', self.subsession.round_number),
                 ('Participant', self.player.participant._id_in_session()),
                 ('Participant label', self.player.participant.label or ''),
-                ('Session code', self.session.code)
-            ]
+                ('Session code', self.session.code),
+            ],
         )
 
         tables.append(basic_info_table)
@@ -345,9 +405,9 @@ class FormPageOrInGameWaitPage(vanilla.View):
 
     def _load_all_models(self):
         '''Load all model instances into idmap cache'''
-        self.PlayerClass.objects.select_related(
-            'group', 'subsession', 'session'
-        ).get(pk=self._player_pk)
+        self.PlayerClass.objects.select_related('group', 'subsession', 'session').get(
+            pk=self._player_pk
+        )
 
     def _is_displayed(self):
         try:
@@ -388,6 +448,7 @@ class FormPageOrInGameWaitPage(vanilla.View):
         return Session.objects.get(pk=self._session_pk)
 
     _round_number = None
+
     @property
     def round_number(self):
         if self._round_number is None:
@@ -400,7 +461,7 @@ class FormPageOrInGameWaitPage(vanilla.View):
 
         app_name = player_lookup['app_name']
 
-        models_module = otree.common_internal.get_models_module(app_name)
+        models_module = otree.common.get_models_module(app_name)
         self._Constants = models_module.Constants
         self.PlayerClass = getattr(models_module, 'Player')
         self.GroupClass = getattr(models_module, 'Group')
@@ -424,10 +485,13 @@ class FormPageOrInGameWaitPage(vanilla.View):
 
         self._is_frozen = True
 
-    # python 3.5 type hint
     def set_attributes_waitpage_clone(self, *, original_view: 'WaitPage'):
         '''put it here so it can be compared with set_attributes...
         but this is really just a method on wait pages'''
+        # make a clean copy for AAPA
+        # self.player and self.participant etc are undefined
+        # and no objects are cached inside it
+        # and it doesn't affect the current instance
 
         self._Constants = original_view._Constants
         self.PlayerClass = original_view.PlayerClass
@@ -451,21 +515,29 @@ class FormPageOrInGameWaitPage(vanilla.View):
         # we skip any page that is a sequence page where is_displayed
         # evaluates to False to eliminate unnecessary redirection
 
+        page_index_to_skip_to = self._get_next_page_index_if_skipping_apps()
+        is_skipping_apps = bool(page_index_to_skip_to)
+
         for page_index in range(
-                # go to max_page_index+2 because range() skips the last index
-                # and it's possible to go to max_page_index + 1 (OutOfRange)
-                self._index_in_pages+1, self.participant._max_page_index+2):
+            # go to max_page_index+2 because range() skips the last index
+            # and it's possible to go to max_page_index + 1 (OutOfRange)
+            self._index_in_pages + 1,
+            self.participant._max_page_index + 2,
+        ):
             self.participant._index_in_pages = page_index
-            if page_index == self.participant._max_page_index+1:
+            if page_index == self.participant._max_page_index + 1:
                 # break and go to OutOfRangeNotification
                 break
+            if is_skipping_apps and page_index == page_index_to_skip_to:
+                break
+
             url = self.participant._url_i_should_be_on()
 
             Page = get_view_from_url(url)
             page = Page()
 
             page.set_attributes(self.participant, lazy=True)
-            if page._is_displayed():
+            if (not is_skipping_apps) and page._is_displayed():
                 break
 
             # if it's a wait page, record that they visited
@@ -489,15 +561,46 @@ class FormPageOrInGameWaitPage(vanilla.View):
 
                 unvisited = page._get_unvisited_ids()
                 if not unvisited:
+                    if page.wait_for_all_groups:
+                        group = None
+                    else:
+                        group = self.group
+                    page._mark_completed_and_notify(group=group)
                     # we don't run after_all_players_arrive()
-                    page._mark_completed()
-                    participant_pk_set = set(
-                        page._group_or_subsession.player_set.values_list(
-                            'participant__pk', flat=True))
-                    page.send_completion_message(participant_pk_set)
 
     def is_displayed(self):
         return True
+
+    def app_after_this_page(self, upcoming_apps):
+        pass
+
+    def _get_next_page_index_if_skipping_apps(self):
+        # don't run it if the page is not displayed, because:
+        # (1) it's consistent with other functions like before_next_page, vars_for_template
+        # (2) then when we do
+        # a lookahead skipping pages, we would need to check each page if it
+        # has app_after_this_page defined, then set attributes and run it.
+        # what if we are already skipping to a future app, then another page
+        # has app_after_this_page? does it override the first one?
+        if not self._is_displayed():
+            return
+
+        current_app = self.participant._current_app_name
+        app_sequence = self.session.config['app_sequence']
+        current_app_index = app_sequence.index(current_app)
+        upcoming_apps = app_sequence[current_app_index + 1 :]
+
+        app_to_skip_to = self.app_after_this_page(upcoming_apps)
+        if app_to_skip_to:
+            if app_to_skip_to not in upcoming_apps:
+                raise InvalidAppError(
+                    f'"{app_to_skip_to}" is not in the upcoming_apps list'
+                )
+            return (
+                ParticipantToPlayerLookup.objects.filter(
+                    participant=self.participant, app_name=app_to_skip_to
+                ).aggregate(Min('page_index'))
+            )['page_index__min']
 
     def _record_page_completion_time(self):
 
@@ -507,7 +610,9 @@ class FormPageOrInGameWaitPage(vanilla.View):
         if last_page_timestamp is None:
             logger.warning(
                 'Participant {}: _last_page_timestamp is None'.format(
-                    self.participant.code))
+                    self.participant.code
+                )
+            )
             last_page_timestamp = now
 
         seconds_on_page = now - last_page_timestamp
@@ -520,12 +625,14 @@ class FormPageOrInGameWaitPage(vanilla.View):
         PageCompletion.objects.create(
             app_name=self.subsession._meta.app_config.name,
             page_index=self._index_in_pages,
-            page_name=page_name, time_stamp=now,
+            page_name=page_name,
+            epoch_time=now,
             seconds_on_page=seconds_on_page,
             subsession_pk=self.subsession.pk,
             participant=self.participant,
             session=self.session,
-            auto_submitted=timeout_happened)
+            auto_submitted=timeout_happened,
+        )
         self.participant.save()
 
     _is_frozen = False
@@ -541,7 +648,7 @@ class FormPageOrInGameWaitPage(vanilla.View):
         'other_fields_with_errors',
         'debug_tables',
         '_round_number',
-        'request' # this is just used in a test case mock.
+        'request',  # this is just used in a test case mock.
     }
 
     def __setattr__(self, attr: str, value):
@@ -555,15 +662,6 @@ class FormPageOrInGameWaitPage(vanilla.View):
             # super() is a bit slower but only gets run during __init__
             super().__setattr__(attr, value)
 
-    def _force_setattr(self, attr: str, value):
-        '''maybe better to use whitelist rather than this;
-        that keeps all the code in 1 place'''
-        orig = self._is_frozen
-        self._is_frozen = False
-        try:
-            setattr(self, attr, value)
-        finally:
-            self._is_frozen = orig
 
 class Page(FormPageOrInGameWaitPage):
 
@@ -593,9 +691,11 @@ class Page(FormPageOrInGameWaitPage):
     def get_template_names(self):
         if self.template_name is not None:
             return [self.template_name]
-        return ['{}/{}.html'.format(
-            get_app_label_from_import_path(self.__module__),
-            self.__class__.__name__)]
+        return [
+            '{}/{}.html'.format(
+                get_app_label_from_import_path(self.__module__), self.__class__.__name__
+            )
+        ]
 
     def get_form_fields(self):
         return self.form_fields
@@ -618,15 +718,6 @@ class Page(FormPageOrInGameWaitPage):
             fields = self.get_form_fields()
         except:
             raise ResponseForException
-        if isinstance(fields, str):
-            # it could also happen with get_form_fields,
-            # but that is much less commonly used, so we word the error
-            # message just about form_fields.
-            msg = (
-                'form_fields should be a list, not the string {fld}. '
-                'Maybe you meant this: form_fields = [{fld}]'
-            ).format(fld=repr(fields))
-            raise ValueError(msg)
         form_model = self._get_form_model()
         if form_model is UndefinedFormModel and fields:
             raise Exception(
@@ -634,10 +725,9 @@ class Page(FormPageOrInGameWaitPage):
                     self.__class__.__name__
                 )
             )
-        return otree.forms.modelform_factory(
-            form_model, fields=fields,
-            form=otree.forms.ModelForm,
-            formfield_callback=otree.forms.formfield_callback)
+        return django.forms.models.modelform_factory(
+            form_model, fields=fields, form=otree.forms.ModelForm
+        )
 
     def before_next_page(self):
         pass
@@ -653,9 +743,7 @@ class Page(FormPageOrInGameWaitPage):
     def form_invalid(self, form):
         context = self.get_context_data(form=form)
 
-        fields_with_errors = [
-            fname for fname in form.errors
-            if fname != '__all__']
+        fields_with_errors = [fname for fname in form.errors if fname != '__all__']
 
         # i think this should be before we call render_to_response
         # because the view (self) is passed to the template and rendered
@@ -664,8 +752,9 @@ class Page(FormPageOrInGameWaitPage):
             self.other_fields_with_errors = fields_with_errors[1:]
 
         response = self.render_to_response(context)
-        response[constants.redisplay_with_errors_http_header] = (
-            constants.get_param_truth_value)
+        response[
+            otree.constants.redisplay_with_errors_http_header
+        ] = otree.constants.get_param_truth_value
 
         return response
 
@@ -676,11 +765,12 @@ class Page(FormPageOrInGameWaitPage):
 
         if self.participant.is_browser_bot:
             submission = browser_bots.get_next_post_data(
-                participant_code=self.participant.code)
+                participant_code=self.participant.code
+            )
             if submission is None:
                 browser_bots.send_completion_message(
                     session_code=self.session.code,
-                    participant_code=self.participant.code
+                    participant_code=self.participant.code,
                 )
                 return HttpResponse(BOT_COMPLETE_HTML_MESSAGE)
             else:
@@ -694,17 +784,17 @@ class Page(FormPageOrInGameWaitPage):
         else:
             post_data = request.POST
 
-        form = self.get_form(
-                data=post_data, files=request.FILES, instance=self.object)
+        form = self.get_form(data=post_data, files=request.FILES, instance=self.object)
         self.form = form
 
-        auto_submitted = request.POST.get(constants.timeout_happened)
+        auto_submitted = request.POST.get(otree.constants.timeout_happened)
 
         # if the page doesn't have a timeout_seconds, only the timeoutworker
         # should be able to auto-submit it.
         # otherwise users could append timeout_happened to the URL to skip pages
         has_secret_code = (
-            request.POST.get(constants.admin_secret_code) == ADMIN_SECRET_CODE)
+            request.POST.get(otree.constants.admin_secret_code) == ADMIN_SECRET_CODE
+        )
 
         # todo: make sure users can't change the result by removing 'timeout_happened'
         # from URL
@@ -721,8 +811,9 @@ class Page(FormPageOrInGameWaitPage):
                         'data with '
                         'SubmissionMustFail, but it passed validation anyway:'
                         ' {}.'.format(
-                            self.__class__.__name__,
-                            bot_prettify_post_data(post_data)))
+                            self.__class__.__name__, bot_prettify_post_data(post_data)
+                        )
+                    )
                 # assigning to self.object is not really necessary
                 self.object = form.save()
             else:
@@ -731,17 +822,16 @@ class Page(FormPageOrInGameWaitPage):
                     PageName = self.__class__.__name__
                     if not post_data.get('must_fail'):
                         errors = [
-                            "{}: {}".format(k, repr(v))
-                            for k, v in form.errors.items()]
+                            "{}: {}".format(k, repr(v)) for k, v in form.errors.items()
+                        ]
                         raise BotError(
                             'Page "{}": Bot submission failed form validation: {} '
-                            'Check your bot in tests.py, '
+                            'Check your bot code, '
                             'then create a new session. '
                             'Data submitted was: {}'.format(
-                                PageName,
-                                errors,
-                                bot_prettify_post_data(post_data),
-                            ))
+                                PageName, errors, bot_prettify_post_data(post_data)
+                            )
+                        )
                     if post_data.get('error_fields'):
                         # need to convert to dict because MultiValueKeyDict
                         # doesn't properly retrieve values that are lists
@@ -753,15 +843,14 @@ class Page(FormPageOrInGameWaitPage):
                                 'Page {}, SubmissionMustFail: '
                                 'Expected error_fields were {}, but actual '
                                 'error_fields are {}'.format(
-                                    PageName,
-                                    expected_error_fields,
-                                    actual_error_fields,
+                                    PageName, expected_error_fields, actual_error_fields
                                 )
                             )
                 return response
         try:
             self.before_next_page()
         except Exception as exc:
+            # why not raise ResponseForException?
             return response_for_exception(self.request, exc)
 
         if self.participant.is_browser_bot:
@@ -774,11 +863,12 @@ class Page(FormPageOrInGameWaitPage):
                     html='',
                 )
                 submission = browser_bots.get_next_post_data(
-                        participant_code=self.participant.code)
+                    participant_code=self.participant.code
+                )
                 if submission is None:
                     browser_bots.send_completion_message(
                         session_code=self.session.code,
-                        participant_code=self.participant.code
+                        participant_code=self.participant.code,
                     )
                     return HttpResponse(BOT_COMPLETE_HTML_MESSAGE)
                 else:
@@ -804,8 +894,7 @@ class Page(FormPageOrInGameWaitPage):
         in template
         '''
         return channel_utils.auto_advance_path(
-            participant_code=self.participant.code,
-            page_index=self._index_in_pages
+            participant_code=self.participant.code, page_index=self._index_in_pages
         )
 
     def redirect_url(self):
@@ -869,10 +958,11 @@ class Page(FormPageOrInGameWaitPage):
 
     def has_timeout_(self):
         return PageTimeout.objects.filter(
-            participant=self.participant,
-            page_index=self.participant._index_in_pages).exists()
+            participant=self.participant, page_index=self.participant._index_in_pages
+        ).exists()
 
     _remaining_timeout_seconds = 'unset'
+
     def remaining_timeout_seconds(self):
 
         if self._remaining_timeout_seconds is not 'unset':
@@ -893,10 +983,11 @@ class Page(FormPageOrInGameWaitPage):
             timeout_object, created = PageTimeout.objects.get_or_create(
                 participant=self.participant,
                 page_index=self.participant._index_in_pages,
-                defaults={'expiration_time': expiration_time})
+                defaults={'expiration_time': expiration_time},
+            )
 
             timeout_seconds = timeout_object.expiration_time - current_time
-            if created and otree.common_internal.USE_REDIS:
+            if created and otree.common.USE_REDIS:
                 # if using browser bots, don't schedule the timeout,
                 # because if it's a short timeout, it could happen before
                 # the browser bot submits the page. Because the timeout
@@ -905,10 +996,7 @@ class Page(FormPageOrInGameWaitPage):
                 # and therefore confuse the bot system.
                 if not self.participant.is_browser_bot:
                     otree.timeout.tasks.submit_expired_url.schedule(
-                        (
-                            self.participant.code,
-                            self.request.path,
-                        ),
+                        (self.participant.code, self.request.path),
                         # add some seconds to account for latency of request + response
                         # this will (almost) ensure
                         # (1) that the page will be submitted by JS before the
@@ -917,10 +1005,10 @@ class Page(FormPageOrInGameWaitPage):
                         # (2) that the timeoutworker doesn't accumulate a lead
                         # ahead of the real page, which could result in being >1
                         # page ahead. that means that entire pages could be skipped
-
                         # task queue can't schedule tasks in the past
                         # at least 1 second from now
-                        delay=max(1, timeout_seconds+8))
+                        delay=max(1, timeout_seconds + 8),
+                    )
         self._remaining_timeout_seconds = timeout_seconds
         return timeout_seconds
 
@@ -932,59 +1020,13 @@ class Page(FormPageOrInGameWaitPage):
     timer_text = ugettext_lazy("Time left to complete this page:")
 
 
-
-
-
-_MSG_Undefined_GetPlayersForGroup = (
-    'You cannot reference self.player, self.group, or self.participant '
-    'inside get_players_for_group.'
-)
-
-_MSG_Undefined_AfterAllPlayersArrive_Player = (
-    'self.player and self.participant cannot be referenced '
-    'inside after_all_players_arrive, '
-    'which is executed only once '
-    'for the entire group.'
-)
-
-_MSG_Undefined_AfterAllPlayersArrive_Group = (
-    'self.group cannot be referenced inside after_all_players_arrive '
-    'if wait_for_all_groups=True, '
-    'because after_all_players_arrive() is executed only once '
-    'for all groups in the subsession.'
-)
-
-class Undefined_AfterAllPlayersArrive_Player:
-    def __getattribute__(self, item):
-        raise AttributeError(_MSG_Undefined_AfterAllPlayersArrive_Player)
-
-    def __setattr__(self, item, value):
-        raise AttributeError(_MSG_Undefined_AfterAllPlayersArrive_Player)
-
-
-class Undefined_AfterAllPlayersArrive_Group:
-    def __getattribute__(self, item):
-        raise AttributeError(_MSG_Undefined_AfterAllPlayersArrive_Group)
-
-    def __setattr__(self, item, value):
-        raise AttributeError(_MSG_Undefined_AfterAllPlayersArrive_Group)
-
-
-class Undefined_GetPlayersForGroup:
-
-    def __getattribute__(self, item):
-        raise AttributeError(_MSG_Undefined_GetPlayersForGroup)
-
-    def __setattr__(self, item, value):
-        raise AttributeError(_MSG_Undefined_GetPlayersForGroup)
-
-
 class GenericWaitPageMixin:
     """used for in-game wait pages, as well as other wait-type pages oTree has
     (like waiting for session to be created, or waiting for players to be
     assigned to matches
 
     """
+
     request = None
 
     def redirect_url(self):
@@ -995,12 +1037,14 @@ class GenericWaitPageMixin:
     def get_template_names(self):
         '''built-in wait pages should not be overridable'''
         return ['otree/WaitPage.html']
-    
+
     def _get_wait_page(self):
         response = TemplateResponse(
-            self.request, self.get_template_names(), self.get_context_data())
-        response[constants.wait_page_http_header] = (
-            constants.get_param_truth_value)
+            self.request, self.get_template_names(), self.get_context_data()
+        )
+        response[
+            otree.constants.wait_page_http_header
+        ] = otree.constants.get_param_truth_value
         return response
 
     # Translators: the default title of a wait page
@@ -1024,11 +1068,7 @@ class GenericWaitPageMixin:
 
         # default title/body text can be overridden
         # if user specifies it in vars_for_template
-        return {
-            'view': self,
-            'title_text': title_text,
-            'body_text': body_text,
-        }
+        return {'view': self, 'title_text': title_text, 'body_text': body_text}
 
 
 class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
@@ -1036,6 +1076,7 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
     Wait pages during game play (i.e. checkpoints),
     where users wait for others to complete
     """
+
     wait_for_all_groups = False
     group_by_arrival_time = False
 
@@ -1055,127 +1096,158 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
         return ['global/WaitPage.html', 'otree/WaitPage.html']
 
     def inner_dispatch(self, *args, **kwargs):
-        ## EARLY EXITS
-        if self._was_completed():
-            return self._save_and_flush_and_response_when_ready()
-        is_displayed = self._is_displayed()
+        with get_redis_lock(name='otree_waitpage') or wait_page_thread_lock:
+            otree.db.idmap.save_objects()
+            idmap.flush()
+            if self.wait_for_all_groups == True:
+                resp = self.inner_dispatch_subsession()
+            elif self.group_by_arrival_time:
+                resp = self.inner_dispatch_gbat()
+            else:
+                resp = self.inner_dispatch_group()
+            return resp
 
-        if self.group_by_arrival_time and not is_displayed:
+    def inner_dispatch_group(self):
+        ## EARLY EXITS
+        if CompletedGroupWaitPage.objects.filter(
+            page_index=self._index_in_pages,
+            id_in_subsession=self.group.id_in_subsession,
+            session=self.session,
+        ).exists():
+            return self._response_when_ready()
+        # if any player can skip the wait page,
+        # then we shouldn't run after_all_players_arrive
+        # because if some players are able to proceed to the next page
+        # before after_all_players_arrive is run,
+        # then after_all_players_arrive is probably not essential.
+        # often, there are some wait pages that all players skip,
+        # because they should only be shown in certain rounds.
+        # maybe the fields that after_all_players_arrive depends on
+        # are null
+        # something to think about: ideally, should we check if
+        # all players skipped, or any player skipped?
+        # as a shortcut, we just check if is_displayed is true
+        # for the last player.
+        if self._is_displayed():
+            if self._get_unvisited_ids():
+                self.participant.is_on_wait_page = True
+                return self._get_wait_page()
+            if isinstance(self.after_all_players_arrive, str):
+                aapa_method = getattr(self.group, self.after_all_players_arrive)
+            else:
+                wp: WaitPage = type(self)()
+                wp.set_attributes_waitpage_clone(original_view=self)
+                wp._group_for_wp_clone = self.group
+
+                aapa_method = wp.after_all_players_arrive
+            try:
+                aapa_method()
+            except:
+                raise ResponseForException
+            # need to save to the results of after_all_players_arrive
+            # to the DB, before sending the completion message to other players
+            # this was causing a race condition on 2016-11-04
+            otree.db.idmap.save_objects()
+
+        # even if this player skips the page and after_all_players_arrive
+        # is not run, we need to indicate that the waiting players can advance
+        self._mark_completed_and_notify(group=self.group)
+        return self._response_when_ready()
+
+    def inner_dispatch_subsession(self):
+
+        if CompletedSubsessionWaitPage.objects.filter(
+            page_index=self._index_in_pages, session=self.session
+        ).exists():
+            return self._save_and_flush_and_response_when_ready()
+
+        if self._is_displayed():
+            if self._get_unvisited_ids():
+                self.participant.is_on_wait_page = True
+                return self._get_wait_page()
+
+            if isinstance(self.after_all_players_arrive, str):
+                aapa_method = getattr(self.subsession, self.after_all_players_arrive)
+            else:
+                wp: WaitPage = type(self)()
+                wp.set_attributes_waitpage_clone(original_view=self)
+                aapa_method = wp.after_all_players_arrive
+            try:
+                aapa_method()
+            except:
+                raise ResponseForException
+            # need to save to the results of after_all_players_arrive
+            # to the DB, before sending the completion message to other players
+            # this was causing a race condition on 2016-11-04
+            otree.db.idmap.save_objects()
+        # even if this player skips the page and after_all_players_arrive
+        # is not run, we need to indicate that the waiting players can advance
+        self._mark_completed_and_notify(group=None)
+        return self._response_when_ready()
+
+    def inner_dispatch_gbat(self):
+        if CompletedGroupWaitPage.objects.filter(
+            page_index=self._index_in_pages,
+            # no race condition, this will be up to date
+            # because after taking the lock we flushed the IDmap cache
+            id_in_subsession=self.group.id_in_subsession,
+            session=self.session,
+        ).exists():
+            return self._response_when_ready()
+
+        if not self._is_displayed():
             # in GBAT, either all players should skip a page, or none should.
             # we don't support some players skipping and others not.
             return self._response_when_ready()
 
-        if is_displayed and not self.group_by_arrival_time:
-            if self._get_unvisited_ids():
-                self.participant.is_on_wait_page = True
-                return self._get_wait_page()
-        ## END EARLY EXITS
+        self.player._gbat_arrived = True
+        # _last_request_timestamp is already set in set_attributes,
+        # but set it here just so we can guarantee
+        self.participant._last_request_timestamp = time.time()
+        # need to save it inside the lock (check-then-act)
+        # also because it needs to be up to date for get_players_for_group
+        # which gets this info from the DB
+        self.player.save()
+        self.participant.save()
 
-        with get_redis_lock(name='otree_waitpage') or wait_page_thread_lock:
-            # setting myself to _gbat_arrived = True should happen inside the lock
-            # because otherwise, another player might be able to see that I have arrived
-            # before I can run get_players_for_group, and they might end up grouping
-            # me. But because I am not in their group, they will not run AAPA for me
-            # so I will be considered 'already_grouped' and redirected to a wait page,
-            # and AAPA will never be run.
+        # make a clean copy for GBAT and AAPA
+        # self.player and self.participant etc are undefined
+        # and no objects are cached inside it
+        # and it doesn't affect the current instance
+        wp: WaitPage = type(self)()
+        wp.set_attributes_waitpage_clone(original_view=self)
 
-            # also, it's simpler in general to have a broad lock.
-            # and easier to explain to users that it will be run as each player
-            # arrives.
+        gbat_new_group = wp._gbat_try_to_make_new_group()
 
-            if self.group_by_arrival_time:
-                self.player._gbat_arrived = True
-                # _last_request_timestamp is already set in set_attributes,
-                # but set it here just so we can guarantee
-                self.participant._last_request_timestamp = time.time()
-                # we call save_objects() below
+        if gbat_new_group:
 
+            if isinstance(self.after_all_players_arrive, str):
+                aapa_method = getattr(gbat_new_group, self.after_all_players_arrive)
+            else:
+                wp._group_for_wp_clone = gbat_new_group
+                aapa_method = wp.after_all_players_arrive
+            try:
+                aapa_method()
+            except:
+                raise ResponseForException
+
+            # need to save before sending completion message
             otree.db.idmap.save_objects()
-            idmap.flush()
 
-            # make a clean copy for GBAT and AAPA
-            # self.player and self.participant etc are undefined
-            # and no objects are cached inside it
-            # and it doesn't affect the current instance
-            wp = type(self)() # type: WaitPage
-            wp.set_attributes_waitpage_clone(original_view=self)
+            self._mark_completed_and_notify(gbat_new_group)
+            # gbat_new_group may not include the current player!
+            # maybe this will not work if i change the implementation
+            # so that the player is cached,
+            # but that's OK because it will be obvious it doesn't work.
+            if self.player._gbat_grouped:
+                return self._save_and_flush_and_response_when_ready()
 
+        self.participant.is_on_wait_page = True
+        return self._get_wait_page()
 
-            # needs to happen before calculating participant_pk_set
-            # because this can change the group or PK
-            if wp.group_by_arrival_time:
-                wp._player_access_forbidden = Undefined_GetPlayersForGroup()
-                wp._participant_access_forbidden = Undefined_GetPlayersForGroup()
-                wp._group_access_forbidden = Undefined_GetPlayersForGroup()
+    def _gbat_try_to_make_new_group(self) -> Optional[BaseGroup]:
+        '''Returns the group ID of the participants who were regrouped'''
 
-                # check if the player was already grouped.
-                # this is a 'check' of the check-then-act, so it needs to be
-                # inside the lock.
-                # It's possible that the player
-                # was grouped, but the Completion object does not exist yet,
-                # because aapa was not run.
-                already_grouped = type(self.player).objects.filter(
-                    id=self.player.id).values_list(
-                    '_gbat_grouped', flat=True)[0]
-                if already_grouped:
-                    regrouped = False
-                else:
-                    # 2017-10-29: what if the current player is not one
-                    # of the people being regrouped?
-                    regrouped = wp._gbat_try_to_regroup()
-
-                if not regrouped:
-                    self.participant.is_on_wait_page = True
-                    return self._get_wait_page()
-
-                wp._player_access_forbidden = None
-                wp._participant_access_forbidden = None
-                wp._group_access_forbidden = None
-
-            # the group membership might be modified
-            # in after_all_players_arrive, so calculate this first
-            participant_pk_set = set(
-                self._group_or_subsession.player_set
-                .values_list('participant__pk', flat=True))
-
-            if not self._was_completed():
-                if is_displayed:
-                    # if any player can skip the wait page,
-                    # then we shouldn't run after_all_players_arrive
-                    # because if some players are able to proceed to the next page
-                    # before after_all_players_arrive is run,
-                    # then after_all_players_arrive is probably not essential.
-                    # often, there are some wait pages that all players skip,
-                    # because they should only be shown in certain rounds.
-                    # maybe the fields that after_all_players_arrive depends on
-                    # are null
-                    # something to think about: ideally, should we check if
-                    # all players skipped, or any player skipped?
-                    # as a shortcut, we just check if is_displayed is true
-                    # for the last player.
-
-                    wp._player_access_forbidden = Undefined_AfterAllPlayersArrive_Player()
-                    wp._participant_access_forbidden = Undefined_AfterAllPlayersArrive_Player()
-                    if wp.wait_for_all_groups:
-                        wp._group_access_forbidden = Undefined_AfterAllPlayersArrive_Group()
-                    else:
-                        wp._group_access_forbidden = None
-                        wp._group_for_aapa = self.group
-                    try:
-                        wp.after_all_players_arrive()
-                    except:
-                        raise ResponseForException
-                    # need to save to the results of after_all_players_arrive
-                    # to the DB, before sending the completion message to other players
-                    # this was causing a race condition on 2016-11-04
-                    otree.db.idmap.save_objects()
-                # even if this player skips the page and after_all_players_arrive
-                # is not run, we need to indicate that the waiting players can advance
-                self._mark_completed()
-                self.send_completion_message(participant_pk_set)
-        return self._save_and_flush_and_response_when_ready()
-
-    def _gbat_try_to_regroup(self):
         # if someone arrives within this many seconds of the last heartbeat of
         # a player who drops out, they will be stuck.
         # that sounds risky, but remember that
@@ -1189,38 +1261,49 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
         STALE_THRESHOLD_SECONDS = 20
 
         # count how many are re-grouped
-        waiting_players = list(self.subsession.player_set.filter(
-            _gbat_arrived=True,
-            _gbat_grouped=False,
-            participant___last_request_timestamp__gte=time.time()-STALE_THRESHOLD_SECONDS
-        ))
+        waiting_players = list(
+            self.subsession.player_set.filter(
+                _gbat_arrived=True,
+                _gbat_grouped=False,
+                participant___last_request_timestamp__gte=time.time()
+                - STALE_THRESHOLD_SECONDS,
+            )
+        )
+
+        gbat_method = getattr(
+            self.subsession, 'group_by_arrival_time_method', self.get_players_for_group
+        )
 
         try:
-            players_for_group = self.get_players_for_group(waiting_players)
+            players_for_group = gbat_method(waiting_players)
         except:
             raise ResponseForException
 
         if not players_for_group:
-            return False
+            return None
         participant_ids = [p.participant.id for p in players_for_group]
 
         group_id_in_subsession = self._gbat_next_group_id_in_subsession()
 
         Constants = self._Constants
 
-        with otree.common_internal.transaction_except_for_sqlite():
-            for round_number in range(self.round_number, Constants.num_rounds+1):
+        this_round_new_group = None
+        with otree.common.transaction_except_for_sqlite():
+            for round_number in range(self.round_number, Constants.num_rounds + 1):
                 subsession = self.subsession.in_round(round_number)
 
                 unordered_players = subsession.player_set.filter(
-                    participant_id__in=participant_ids)
+                    participant_id__in=participant_ids
+                )
 
                 participant_ids_to_players = {
-                    player.participant.id: player for player in unordered_players}
+                    player.participant.id: player for player in unordered_players
+                }
 
                 ordered_players_for_group = [
                     participant_ids_to_players[participant_id]
-                    for participant_id in participant_ids]
+                    for participant_id in participant_ids
+                ]
 
                 if round_number == self.round_number:
                     for player in ordered_players_for_group:
@@ -1228,15 +1311,21 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
                         player.save()
 
                 group = self.GroupClass.objects.create(
-                    subsession=subsession, id_in_subsession=group_id_in_subsession,
-                    session=self.session, round_number=round_number)
+                    subsession=subsession,
+                    id_in_subsession=group_id_in_subsession,
+                    session=self.session,
+                    round_number=round_number,
+                )
                 group.set_players(ordered_players_for_group)
+
+                if round_number == self.round_number:
+                    this_round_new_group = group
 
                 # prune groups without players
                 # apparently player__isnull=True works, didn't know you could
                 # use this in a reverse direction.
                 subsession.group_set.filter(player__isnull=True).delete()
-        return True
+        return this_round_new_group
 
     def get_players_for_group(self, waiting_players):
         Constants = self._Constants
@@ -1251,36 +1340,29 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
             )
 
         if len(waiting_players) >= Constants.players_per_group:
-            return waiting_players[:Constants.players_per_group]
+            return waiting_players[: Constants.players_per_group]
 
     def _gbat_next_group_id_in_subsession(self):
         # 2017-05-05: seems like this can result in id_in_subsession that
         # doesn't start from 1.
         # especially if you do group_by_arrival_time in every round
         # is that a problem?
-        res = self.GroupClass.objects.filter(
-            session=self.session).aggregate(Max('id_in_subsession'))
+        res = self.GroupClass.objects.filter(session=self.session).aggregate(
+            Max('id_in_subsession')
+        )
         return res['id_in_subsession__max'] + 1
-
-    _player_access_forbidden = None
-    @property
-    def player(self):
-        return self._player_access_forbidden or super().player
-
-    _group_access_forbidden = None
-    _group_for_aapa = None
-    @property
-    def group(self):
-        return self._group_access_forbidden or self._group_for_aapa or super().group
-
-    _participant_access_forbidden = None
-    @property
-    def participant(self):
-        return self._participant_access_forbidden or super().participant
 
     @property
     def _group_or_subsession(self):
         return self.subsession if self.wait_for_all_groups else self.group
+
+    # this is needed because on wait pages, self.player doesn't exist.
+    # usually oTree finds the group by doing self.player.group.
+    _group_for_wp_clone = None
+
+    @property
+    def group(self):
+        return self._group_for_wp_clone or super().group
 
     def _save_and_flush_and_response_when_ready(self):
         # need to deactivate cache, in case after_all_players_arrive
@@ -1305,86 +1387,82 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
         # that was set on the wait page, so need to refresh participant,
         # because it is passed as an arg to set_attributes().
 
-
         otree.db.idmap.save_objects()
         idmap.flush()
         return self._response_when_ready()
 
-    def _was_completed(self):
-        if self.wait_for_all_groups:
-            return CompletedSubsessionWaitPage.objects.filter(
-                page_index=self._index_in_pages,
-                session=self.session,
-            ).exists()
-        return CompletedGroupWaitPage.objects.filter(
-            page_index=self._index_in_pages,
-            id_in_subsession=self.group.id_in_subsession,
-            session=self.session,
-        ).exists()
-
-    def _mark_completed(self):
+    def _mark_completed_and_notify(self, group: Optional[BaseGroup]):
+        # if group is not passed, then it's the whole subsession
         # could be 2 people creating the record at the same time
         # in _increment_index_in_pages, so could end up creating 2 records
         # but it's not a problem.
+
+        base_kwargs = dict(page_index=self._index_in_pages, session_id=self._session_pk)
+
         if self.wait_for_all_groups:
-            CompletedSubsessionWaitPage.objects.create(
-                page_index=self._index_in_pages,
-                session=self.session
-            )
+            CompletedSubsessionWaitPage.objects.create(**base_kwargs)
+            obj = self.subsession
         else:
             CompletedGroupWaitPage.objects.create(
-                page_index=self._index_in_pages,
-                id_in_subsession=self.group.id_in_subsession,
-                session=self.session
+                **base_kwargs, id_in_subsession=group.id_in_subsession
             )
+            obj = group
 
-    def send_completion_message(self, participant_pk_set):
-
-        if otree.common_internal.USE_REDIS:
+        if otree.common.USE_REDIS:
+            participant_pks = obj.player_set.values_list('participant__pk', flat=True)
             # 2016-11-15: we used to only ensure the next page is visited
             # if the next page has a timeout, or if it's a wait page
             # but this is not reliable because next page might be skipped anyway,
             # and we don't know what page will actually be shown next to the user.
             otree.timeout.tasks.ensure_pages_visited.schedule(
-                kwargs={
-                    'participant_pk_set': participant_pk_set},
-                delay=10)
+                kwargs={'participant_pks': participant_pks}, delay=10
+            )
 
-        # _group_or_subsession might be deleted
-        # in after_all_players_arrive, but it won't delete the cached model
-        channels_group_name = self.get_channels_group_name()
-        channels.Group(channels_group_name).send(
-            {'text': json.dumps(
-                {'status': 'ready'})}
-        )
-
-    def _channels_group_id_in_subsession(self):
-        if self.wait_for_all_groups:
-            return ''
-        return self.group.id_in_subsession
-
-    def get_channels_group_name(self):
         if self.group_by_arrival_time:
-            return self._gbat_get_channels_group_name()
-        group_id_in_subsession = self._channels_group_id_in_subsession()
+            channel_utils.sync_group_send_wrapper(
+                type='gbat_ready',
+                group=channel_utils.gbat_group_name(**base_kwargs),
+                event={},
+            )
+        else:
+            if self.wait_for_all_groups:
+                channels_group_name = channel_utils.subsession_wait_page_name(
+                    **base_kwargs
+                )
+            else:
+                channels_group_name = channel_utils.group_wait_page_name(
+                    **base_kwargs, group_id_in_subsession=group.id_in_subsession
+                )
 
-        return channel_utils.wait_page_group_name(
-            session_pk=self._session_pk,
-            page_index=self._index_in_pages,
-            group_id_in_subsession=group_id_in_subsession)
+            channel_utils.sync_group_send_wrapper(
+                type='wait_page_ready', group=channels_group_name, event={}
+            )
 
     def socket_url(self):
+        session_pk = self._session_pk
+        page_index = self._index_in_pages
+        participant_id = self._participant_pk
         if self.group_by_arrival_time:
-            return self._gbat_socket_url()
-
-        group_id_in_subsession = self._channels_group_id_in_subsession()
-
-        return channel_utils.wait_page_path(
-            self._session_pk,
-            self._index_in_pages,
-            group_id_in_subsession
-        )
-
+            return channel_utils.gbat_path(
+                session_pk=session_pk,
+                page_index=page_index,
+                app_name=self.player._meta.app_config.name,
+                participant_id=participant_id,
+                player_id=self.player.id,
+            )
+        elif self.wait_for_all_groups:
+            return channel_utils.subsession_wait_page_path(
+                session_pk=session_pk,
+                page_index=page_index,
+                participant_id=participant_id,
+            )
+        else:
+            return channel_utils.group_wait_page_path(
+                session_pk=session_pk,
+                page_index=page_index,
+                participant_id=participant_id,
+                group_id_in_subsession=self.group.id_in_subsession,
+            )
 
     def _get_unvisited_ids(self):
         """
@@ -1393,12 +1471,14 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
 
         participant_ids = set(
             self._group_or_subsession.player_set.values_list(
-                'participant_id', flat=True))
+                'participant_id', flat=True
+            )
+        )
 
         # essential query whose results can change from moment to moment
-        participant_data = Participant.objects.filter(
-            id__in=participant_ids
-        ).values('id', 'id_in_session', '_index_in_pages')
+        participant_data = Participant.objects.filter(id__in=participant_ids).values(
+            'id', 'id_in_session', '_index_in_pages'
+        )
 
         visited = []
         unvisited = []
@@ -1414,12 +1494,13 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
         if 1 <= len(unvisited) <= 3:
 
             unvisited_description = ', '.join(
-                'P{}'.format(p['id_in_session']) for p in unvisited)
+                'P{}'.format(p['id_in_session']) for p in unvisited
+            )
 
             visited_ids = [p['id'] for p in visited]
-            Participant.objects.filter(
-                id__in=visited_ids
-            ).update(_waiting_for_ids=unvisited_description)
+            Participant.objects.filter(id__in=visited_ids).update(
+                _waiting_for_ids=unvisited_description
+            )
 
         return {p['id'] for p in unvisited}
 
@@ -1449,55 +1530,38 @@ class WaitPage(FormPageOrInGameWaitPage, GenericWaitPageMixin):
             return _('Waiting for the other participant.')
         return ''
 
-    ## THE REST OF THIS CLASS IS GROUP_BY_ARRIVAL_TIME STUFF
-
-
-    def _gbat_get_channels_group_name(self):
-            return channel_utils.gbat_group_name(
-                session_pk=self._session_pk, page_index=self._index_in_pages,
-            )
-
-    def _gbat_socket_url(self):
-        return channel_utils.gbat_path(
-            self._session_pk, self._index_in_pages,
-            self.player._meta.app_config.name, self.player.id)
-
 
 class AdminSessionPageMixin:
-
     @classmethod
     def url_pattern(cls):
         return r"^{}/(?P<code>[a-z0-9]+)/$".format(cls.__name__)
 
     def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        context.update({
-            'session': self.session,
-            'is_debug': settings.DEBUG,
-            'request': self.request,
-        })
+        context = super().get_context_data(
+            session=self.session,
+            is_debug=settings.DEBUG,
+            request=self.request,
+            **kwargs,
+        )
+        # vars_for_template has highest priority
+        context.update(self.vars_for_template())
         return context
+
+    def vars_for_template(self):
+        '''
+        simpler to use vars_for_template, but need to use get_context_data when:
+        -   you need access to the context produced by the parent class,
+            such as the form
+        '''
+        return {}
 
     def get_template_names(self):
         return ['otree/admin/{}.html'.format(self.__class__.__name__)]
 
-    def dispatch(self, request, *args, **kwargs):
-        session_code = kwargs['code']
-        self.session = get_object_or_404(
-            otree.models.Session, code=session_code)
-        return super().dispatch(
-            request, *args, **kwargs)
+    def dispatch(self, request, code, **kwargs):
+        self.session = get_object_or_404(otree.models.Session, code=code)
+        return super().dispatch(request, **kwargs)
 
-    def get_form_class(self):
-        """A drop-in replacement for
-        ``vanilla.model_views.GenericModelView.get_form_class``. The only
-        difference is that we use oTree's modelform_factory in order to always
-        get a floppyfied form back which supports richer widgets.
-        """
-        if self.form_class is not None:
-            return self.form_class
 
-        return otree.forms.modelform_factory(
-            self.model,
-            fields=self.fields,
-            formfield_callback=otree.forms.formfield_callback)
+class InvalidAppError(Exception):
+    pass

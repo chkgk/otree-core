@@ -1,24 +1,20 @@
-from typing import List
+import datetime
 import logging
+import os
 from collections import OrderedDict, defaultdict
-from unittest import mock
-
+from pathlib import Path
+from typing import List
 
 from django.conf import settings
-import pytest
-import sys
 
-import otree.session
-import otree.common_internal
-
-from .bot import ParticipantBot
-import datetime
-import os
-import codecs
+import otree.common
 import otree.export
-from otree.constants_internal import AUTO_NAME_BOTS_EXPORT_FOLDER
-from otree.models_concrete import ParticipantToPlayerLookup
+import otree.session
+from otree.constants import AUTO_NAME_BOTS_EXPORT_FOLDER
 from otree.models import Session, Participant
+from otree.models_concrete import ParticipantToPlayerLookup
+from otree.session import SESSION_CONFIGS_DICT
+from .bot import ParticipantBot
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +51,7 @@ class SessionBotRunner:
                         self.bots.pop(pk)
                         progress_made = True
                     else:
-                        bot.submit(submission)
+                        bot.submit(**submission)
                         progress_made = True
             if not progress_made:
                 loops_without_progress += 1
@@ -75,8 +71,9 @@ def make_bots(*, session_pk, case_number, use_browser_bots) -> List[ParticipantB
 
     # can't use .distinct('player_pk') because it only works on Postgres
     # this implicitly orders by round also
-    lookups = ParticipantToPlayerLookup.objects.filter(
-        session_pk=session_pk).order_by('page_index')
+    lookups = ParticipantToPlayerLookup.objects.filter(session_pk=session_pk).order_by(
+        'page_index'
+    )
 
     seen_players = set()
     lookups_per_participant = defaultdict(list)
@@ -101,40 +98,44 @@ def run_bots(session: Session, case_number=None):
     runner.play()
 
 
-# function name needs to start with "test" for pytest to discover it
-# in this module
-@pytest.mark.django_db(transaction=True)
-def test_all_bots_for_session_config(
-        session_config_name, num_participants, *, run_export):
-    config_name = session_config_name
-    session_config = otree.session.SESSION_CONFIGS_DICT[config_name]
+def run_all_bots_for_session_config(
+    session_config_name, num_participants, export_path
+):
+    """
+    this means all test cases are in 1 big test case.
+    so if 1 fails, the others will not get run.
+    """
+    if session_config_name:
+        session_config_names = [session_config_name]
+    else:
+        session_config_names = SESSION_CONFIGS_DICT.keys()
 
-    # num_bots is deprecated, because the old default of 12 or 6 was too
-    # much, and it doesn't make sense to
-    if num_participants is None:
-        num_participants = session_config['num_demo_participants']
+    for config_name in session_config_names:
+        try:
+            config = SESSION_CONFIGS_DICT[config_name]
+        except KeyError:
+            # important to alert the user, since people might be trying to enter app names.
+            msg = f"No session config with name '{config_name}'."
+            raise Exception(msg) from None
 
-    num_bot_cases = session_config.get_num_bot_cases()
-    for case_number in range(num_bot_cases):
-        if num_bot_cases > 1:
-            logger.info("Creating '{}' session (test case {})".format(
-                config_name, case_number))
-        else:
-            logger.info("Creating '{}' session".format(config_name))
+        num_bot_cases = config.get_num_bot_cases()
+        for case_number in range(num_bot_cases):
+            logger.info(
+                "Creating '{}' session (test case {})".format(
+                    config_name, case_number
+                )
+            )
 
-        session = otree.session.create_session(
-            session_config_name=config_name,
-            num_participants=num_participants,
-        )
+            session = otree.session.create_session(
+                session_config_name=config_name,
+                num_participants=(
+                    num_participants or config['num_demo_participants']
+                ),
+            )
+            run_bots(session, case_number=case_number)
 
-        run_bots(session, case_number=case_number)
-        logger.info('Bots completed session')
-    if run_export:
-        # bug: if the user tests multiple session configs,
-        # the data will only be exported for the last session config.
-        # this is because the DB is cleared after each test case.
-        # fix later if this becomes high priority
-        export_path = pytest.config.option.export_path
+            logger.info('Bots completed session')
+    if export_path:
 
         now = datetime.datetime.now()
 
@@ -142,59 +143,21 @@ def test_all_bots_for_session_config(
             # oTree convention to prefix __temp all temp folders.
             export_path = now.strftime('__temp_bots_%b%d_%Hh%Mm%S.%f')[:-5] + 's'
 
-        if os.path.isdir(export_path):
-            msg = "Directory '{}' already exists".format(export_path)
-            raise IOError(msg)
-
-        os.makedirs(export_path)
+        os.makedirs(export_path, exist_ok=True)
 
         for app in settings.INSTALLED_OTREE_APPS:
-            model_module = otree.common_internal.get_models_module(app)
+            model_module = otree.common.get_models_module(app)
             if model_module.Player.objects.exists():
-                fname = "{}.csv".format(app)
-                fpath = os.path.join(export_path, fname)
-                with codecs.open(fpath, "w", encoding="utf8") as fp:
+                fpath = Path(export_path, "{}.csv".format(app))
+                with fpath.open("w", encoding="utf8") as fp:
                     otree.export.export_app(app, fp, file_extension='csv')
+        fpath = Path(export_path, "all_apps_wide.csv")
+        with fpath.open("w", encoding="utf8") as fp:
+            otree.export.export_wide(fp, 'csv')
 
         logger.info('Exported CSV to folder "{}"'.format(export_path))
-
-
-def run_pytests(**kwargs):
-    session_config_name = kwargs['session_config_name']
-    num_participants = kwargs['num_participants']
-    verbosity = kwargs['verbosity']
-
-    this_module = sys.modules[__name__]
-
-    # '-s' is to see print output
-    # --tb=short is to show short tracebacks. I think this is
-    # more expected and less verbose.
-    # With the default pytest long tracebacks,
-    # often the code that gets printed is in otree-core, which is not relevant.
-    # also, this is better than using --tb=native, which loses line breaks
-    # when a unicode char is contained in the output, and also doesn't get
-    # color coded with colorama, the way short tracebacks do.
-    argv = [
-        this_module.__file__,
-        '-s',
-        '--tb', 'short'
-    ]
-    if verbosity == 0:
-        argv.append('--quiet')
-    if verbosity == 2:
-        argv.append('--verbose')
-
-    if session_config_name:
-        argv.extend(['--session_config_name', session_config_name])
-    if num_participants:
-        argv.extend(['--num_participants', num_participants])
-    if kwargs['preserve_data']:
-        argv.append('--preserve_data')
-    if kwargs['export_path']:
-        argv.extend(['--export_path', kwargs['export_path']])
-
-    # same hack as in resetdb code
-    # because this method uses the serializer
-    # it breaks if the app has migrations but they aren't up to date
-    otree.common_internal.patch_migrations_module()
-    return pytest.main(argv)
+    else:
+        logger.info(
+            'Tip: Run this command with the --export flag'
+            ' to save the data generated by bots.'
+        )

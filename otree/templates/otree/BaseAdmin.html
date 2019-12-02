@@ -19,8 +19,7 @@
 <script>
 $(function () {
     $('[data-toggle="popover"]').popover()
-});
-$(function(){
+
     // if top menu link is clicked inside iframe
     // we exit full mode
     $("#top_menu a").click(function() {
@@ -28,20 +27,27 @@ $(function(){
                 window.parent.location.href = $(this).attr("href");
         }
     });
-});
-$(function () {
-    $.ajax({
-        url: '{% url 'OtreeCoreUpdateCheck' %}',
-        type: 'GET',
-        success: function(data) {
-            if (!data.pypi_connection_error) {
-                if (data.update_needed) {
-                    $('._otree-updates').html(
-                        '<a class="nav-link" href="{% url 'ServerCheck' %}"><small>Update available</small></a>')
-                }
-            }
-        }
-    });
+
+    // i guess sockets must be global variables, and i should name it
+    // something other than 'socket' because there might be other sockets
+    // in descendant pages
+    var disconnectionSocket;
+
+    function setupDisconnectedAlert() {
+        disconnectionSocket = makeReconnectingWebSocket('/no_op/');
+        var socket = disconnectionSocket;
+
+        var alertStyle = document.querySelector('#disconnected-alert').style;
+        socket.onopen = function (e) {
+            alertStyle.visibility = 'hidden';
+        };
+
+        socket.onclose = function (e) {
+            alertStyle.visibility = 'visible';
+        };
+    }
+    setupDisconnectedAlert();
+
 });
 
 </script>
@@ -67,7 +73,6 @@ $(function () {
                 <li class="nav-item"><a class="nav-link" href="{% url 'Rooms' %}">Rooms</a></li>
                 <li class="nav-item"><a class="nav-link" href="{% url 'ExportIndex' %}">Data</a></li>
                 <li class="nav-item"><a class="nav-link" href="{% url 'ServerCheck' %}">Server Check</a></li>
-                <li class="nav-item _otree-updates"></li>
 
                 {% if request.user.is_authenticated|default:False %}
                     <li><a class="nav-link" href="{% url 'logout' %}">Logout</a></li>
@@ -87,5 +92,13 @@ $(function () {
     </div>
     <br/>
 </div>
-{% endblock %}
-<!--end body_main-->
+{% comment %}
+  this exists so that if there is an error in oTree's channel consumers,
+  such as data export or rooms, the user gets some notification rather than it silently
+  failing.
+  don't put it in global base template even though it could be useful there too,
+  because we don't want to pollute "view source"
+  in user-defined pages
+{% endcomment %}
+<div id='websocket-server-error' class="top-left-fixed-alert" style="visibility: hidden"></div>
+{% endblock body_main %}
