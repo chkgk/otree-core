@@ -1,6 +1,7 @@
 import logging
 from django.core.management import call_command
 from . import webandworkers
+from otree.extensions import get_extensions_modules
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +38,14 @@ class Command(webandworkers.Command):
         honcho.add_otree_process('botworker', 'otree botworker')
         honcho.add_otree_process('timeoutworkeronly', 'otree timeoutworkeronly')
 
-        # add one worker for each task
-        from otree.extensions import get_extensions_modules
+        # add one process for all background tasks
         channel_name_routes = []
         for extensions_module in get_extensions_modules('routing'):
             channel_name_routes += getattr(extensions_module, "channel_name_routes", {}).keys()
 
-        for route in channel_name_routes:
-            honcho.add_otree_process('backgrondworker', 'otree runworker %s' % route)
+        if channel_name_routes:
+            route_string = " ".join(channel_name_routes)
+            honcho.add_otree_process('backgroundworker', 'otree runworker %s' % route_string)
 
     def handle(self, *args, collectstatic, **options):
 
